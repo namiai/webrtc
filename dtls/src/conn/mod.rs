@@ -830,6 +830,8 @@ impl DTLSConn {
             let (done_tx, mut done_rx) = mpsc::channel(1);
 
             tokio::select! {
+                biased;
+                _ = ctx.handshake_done_rx.recv() => {}
                 _ = ctx.handshake_tx.send(done_tx) => {
                     let mut wait_done_rx = true;
                     while wait_done_rx{
