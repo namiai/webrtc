@@ -852,7 +852,6 @@ impl DTLSConn {
                         }
                     }
                 }
-                _ = ctx.handshake_done_rx.recv() => {}
             }
         }
 
