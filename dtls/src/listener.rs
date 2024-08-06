@@ -13,6 +13,9 @@ use crate::config::*;
 use crate::conn::DTLSConn;
 use crate::content::ContentType;
 use crate::error::Result;
+use crate::handshake::HandshakeType;
+use crate::handshake::handshake_header::HandshakeHeader;
+use crate::handshake::handshake_message_client_hello::HandshakeMessageClientHello;
 use crate::record_layer::record_layer_header::RecordLayerHeader;
 use crate::record_layer::unpack_datagram;
 
@@ -40,6 +43,40 @@ pub async fn listen<A: 'static + ToSocketAddrs>(laddr: A, config: Config) -> Res
                         Box::pin(async move { content_type == ContentType::Handshake })
                     }
                     Err(_) => Box::pin(async { false }),
+                }
+            },
+        )),
+        new_conn_filter: Some(Box::new(
+            |packet: &[u8]| -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
+                let pkts = match unpack_datagram(packet) {
+                    Ok(pkts) => {
+                        if pkts.is_empty() {
+                            return Box::pin(async { false });
+                        }
+                        pkts
+                    }
+                    Err(_) => return Box::pin(async { false }),
+                };
+
+                let mut reader = BufReader::new(pkts[0].as_slice());
+                match (
+                    RecordLayerHeader::unmarshal(&mut reader),
+                    HandshakeHeader::unmarshal(&mut reader),
+                    HandshakeMessageClientHello::unmarshal(&mut reader),
+                ) {
+                    (Ok(h), Ok(hh), Ok(ch)) => {
+                        let epoch = h.epoch;
+                        let content_type = h.content_type;
+                        let handshake_type = hh.handshake_type;
+                        let cookie = ch.cookie;
+                        Box::pin(async move {
+                            epoch == 0 &&
+                                content_type == ContentType::Handshake &&
+                                handshake_type == HandshakeType::ClientHello &&
+                                cookie.is_empty()
+                        })
+                    }
+                    _ => Box::pin(async { false }),
                 }
             },
         )),

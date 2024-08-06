@@ -19,6 +19,8 @@ pub type AcceptFilterFn =
 
 type AcceptDoneCh = (mpsc::Receiver<Arc<UdpConn>>, watch::Receiver<()>);
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct SessionId(String);
 /// listener is used in the [DTLS](https://github.com/webrtc-rs/dtls) and
 /// [SCTP](https://github.com/webrtc-rs/sctp) transport to provide a connection-oriented
 /// listener over a UDP.
@@ -28,7 +30,7 @@ struct ListenerImpl {
     accept_ch_tx: Arc<Mutex<Option<mpsc::Sender<Arc<UdpConn>>>>>,
     done_ch_tx: Arc<Mutex<Option<watch::Sender<()>>>>,
     ch_rx: Arc<Mutex<AcceptDoneCh>>,
-    conns: Arc<Mutex<HashMap<String, Arc<UdpConn>>>>,
+    conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
 }
 
 #[async_trait]
@@ -88,6 +90,11 @@ pub struct ListenConfig {
     /// AcceptFilter determines whether the new conn should be made for
     /// the incoming packet. If not set, any packet creates new conn.
     pub accept_filter: Option<AcceptFilterFn>,
+    /// New connection filter determines whether new conn should be
+    /// made for the incoming packet if the source port / address is the same
+    /// as in the existing connection.
+    /// It's done to satisfy the requirement rfc6347#section-4.2.8
+    pub new_conn_filter: Option<AcceptFilterFn>,
 }
 
 pub async fn listen<A: ToSocketAddrs>(laddr: A) -> Result<impl Listener> {
@@ -117,6 +124,7 @@ impl ListenConfig {
         let pconn = Arc::clone(&l.pconn);
         let accepting = Arc::clone(&l.accepting);
         let accept_filter = self.accept_filter.take();
+        let new_conn_filter = self.new_conn_filter.take();
         let accept_ch_tx = Arc::clone(&l.accept_ch_tx);
         let conns = Arc::clone(&l.conns);
         tokio::spawn(async move {
@@ -125,6 +133,7 @@ impl ListenConfig {
                 pconn,
                 accepting,
                 accept_filter,
+                new_conn_filter,
                 accept_ch_tx,
                 conns,
             )
@@ -143,8 +152,9 @@ impl ListenConfig {
         pconn: Arc<dyn Conn + Send + Sync>,
         accepting: Arc<AtomicBool>,
         accept_filter: Option<AcceptFilterFn>,
+        new_conn_filter: Option<AcceptFilterFn>,
         accept_ch_tx: Arc<Mutex<Option<mpsc::Sender<Arc<UdpConn>>>>>,
-        conns: Arc<Mutex<HashMap<String, Arc<UdpConn>>>>,
+        conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
     ) {
         let mut buf = vec![0u8; RECEIVE_MTU];
 
@@ -160,6 +170,7 @@ impl ListenConfig {
                                 &pconn,
                                 &accepting,
                                 &accept_filter,
+                                &new_conn_filter,
                                 &accept_ch_tx,
                                 &conns,
                                 raddr,
@@ -189,15 +200,22 @@ impl ListenConfig {
         pconn: &Arc<dyn Conn + Send + Sync>,
         accepting: &Arc<AtomicBool>,
         accept_filter: &Option<AcceptFilterFn>,
+        new_conn_filter: &Option<AcceptFilterFn>,
         accept_ch_tx: &Arc<Mutex<Option<mpsc::Sender<Arc<UdpConn>>>>>,
-        conns: &Arc<Mutex<HashMap<String, Arc<UdpConn>>>>,
+        conns: &Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
         raddr: SocketAddr,
         buf: &[u8],
     ) -> Result<Option<Arc<UdpConn>>> {
         {
             let m = conns.lock().await;
-            if let Some(conn) = m.get(raddr.to_string().as_str()) {
-                return Ok(Some(conn.clone()));
+            if let Some(conn) = m.get(raddr.to_string().as_str()).and_then(|v| v.last()) {
+                if let Some(f) = new_conn_filter {
+                    if !(f(buf).await) {
+                        return Ok(Some(conn.clone()));
+                    }
+                } else {
+                    return Ok(Some(conn.clone()));
+                }
             }
         }
 
@@ -211,7 +229,8 @@ impl ListenConfig {
             }
         }
 
-        let udp_conn = Arc::new(UdpConn::new(Arc::clone(pconn), Arc::clone(conns), raddr));
+        let session_id = SessionId(rand::random::<u64>().to_string());
+        let udp_conn = Arc::new(UdpConn::new(Arc::clone(pconn), Arc::clone(conns), raddr, session_id));
         {
             let accept_ch = accept_ch_tx.lock().await;
             if let Some(tx) = &*accept_ch {
@@ -225,7 +244,8 @@ impl ListenConfig {
 
         {
             let mut m = conns.lock().await;
-            m.insert(raddr.to_string(), Arc::clone(&udp_conn));
+            let existing_value = m.entry(raddr.to_string()).or_insert_with(Vec::new);
+            existing_value.push(Arc::clone(&udp_conn));
         }
 
         Ok(Some(udp_conn))
@@ -235,21 +255,24 @@ impl ListenConfig {
 /// UdpConn augments a connection-oriented connection over a UdpSocket
 pub struct UdpConn {
     pconn: Arc<dyn Conn + Send + Sync>,
-    conns: Arc<Mutex<HashMap<String, Arc<UdpConn>>>>,
+    conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
     raddr: SocketAddr,
     buffer: Buffer,
+    session_id: SessionId,
 }
 
 impl UdpConn {
     fn new(
         pconn: Arc<dyn Conn + Send + Sync>,
-        conns: Arc<Mutex<HashMap<String, Arc<UdpConn>>>>,
+        conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
         raddr: SocketAddr,
+        session_id: SessionId,
     ) -> Self {
         UdpConn {
             pconn,
             conns,
             raddr,
+            session_id,
             buffer: Buffer::new(0, 0),
         }
     }
@@ -288,7 +311,9 @@ impl Conn for UdpConn {
 
     async fn close(&self) -> Result<()> {
         let mut conns = self.conns.lock().await;
-        conns.remove(self.raddr.to_string().as_str());
+        if let Some(existing_value) = conns.get_mut(self.raddr.to_string().as_str()) {
+            existing_value.retain(|c| c.session_id != self.session_id);
+        }
         Ok(())
     }
 
