@@ -45,6 +45,8 @@ pub(crate) const INBOUND_BUFFER_SIZE: usize = 8192;
 // Default replay protection window is specified by RFC 6347 Section 4.1.2.6
 pub(crate) const DEFAULT_REPLAY_PROTECTION_WINDOW: usize = 64;
 
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub static INVALID_KEYING_LABELS: &[&str] = &[
     "client finished",
     "server finished",
@@ -407,7 +409,17 @@ impl DTLSConn {
         });
 
         // Do handshake
-        c.handshake(initial_fsm_state).await?;
+        //
+        // if the handshake is not finished in 30 seconds, close the connection
+        // and return an error
+        tokio::select! {
+            _ = tokio::time::sleep(HANDSHAKE_TIMEOUT) => {
+                c.close().await?;
+                return Err(Error::ErrDeadlineExceeded)
+            }
+            ,
+            v = c.handshake(initial_fsm_state) => {v?}
+        }
 
         trace!("Handshake Completed");
 
