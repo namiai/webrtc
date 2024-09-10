@@ -23,7 +23,13 @@ use crate::record_layer::unpack_datagram;
 pub async fn listen<A: 'static + ToSocketAddrs>(laddr: A, config: Config) -> Result<impl Listener> {
     validate_config(false, &config)?;
 
-    let mut lc = ListenConfig {
+    let mut lc = create_dtls_listen_config();
+    let parent = Arc::new(lc.listen(laddr).await?);
+    Ok(DTLSListener { parent, config })
+}
+
+pub fn create_dtls_listen_config() -> ListenConfig {
+    ListenConfig {
         accept_filter: Some(Box::new(
             |packet: &[u8]| -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
                 let pkts = match unpack_datagram(packet) {
@@ -81,10 +87,7 @@ pub async fn listen<A: 'static + ToSocketAddrs>(laddr: A, config: Config) -> Res
             },
         )),
         ..Default::default()
-    };
-
-    let parent = Arc::new(lc.listen(laddr).await?);
-    Ok(DTLSListener { parent, config })
+    }
 }
 
 /// DTLSListener represents a DTLS listener

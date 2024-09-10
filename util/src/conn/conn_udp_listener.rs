@@ -101,6 +101,11 @@ pub async fn listen<A: ToSocketAddrs>(laddr: A) -> Result<impl Listener> {
     ListenConfig::default().listen(laddr).await
 }
 
+pub async fn listen_with_config<A: ToSocketAddrs>(laddr: A, config: ListenConfig) -> Result<impl Listener> {
+    let mut config = config;
+    config.listen(laddr).await
+}
+
 impl ListenConfig {
     /// Listen creates a new listener based on the ListenConfig.
     pub async fn listen<A: ToSocketAddrs>(&mut self, laddr: A) -> Result<impl Listener> {
