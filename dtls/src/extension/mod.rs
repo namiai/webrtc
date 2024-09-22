@@ -1,3 +1,4 @@
+pub mod extension_connection_id;
 pub mod extension_server_name;
 pub mod extension_supported_elliptic_curves;
 pub mod extension_supported_point_formats;
@@ -19,6 +20,8 @@ use extension_use_srtp::*;
 use crate::error::*;
 use crate::extension::renegotiation_info::ExtensionRenegotiationInfo;
 
+use self::extension_connection_id::ExtensionConnectionId;
+
 // https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtensionValue {
@@ -28,6 +31,7 @@ pub enum ExtensionValue {
     SupportedSignatureAlgorithms = 13,
     UseSrtp = 14,
     UseExtendedMasterSecret = 23,
+    ConnectionId = 54,
     RenegotiationInfo = 65281,
     Unsupported,
 }
@@ -41,6 +45,7 @@ impl From<u16> for ExtensionValue {
             13 => ExtensionValue::SupportedSignatureAlgorithms,
             14 => ExtensionValue::UseSrtp,
             23 => ExtensionValue::UseExtendedMasterSecret,
+            54 => ExtensionValue::ConnectionId,
             65281 => ExtensionValue::RenegotiationInfo,
             _ => ExtensionValue::Unsupported,
         }
@@ -56,6 +61,7 @@ pub enum Extension {
     UseSrtp(ExtensionUseSrtp),
     UseExtendedMasterSecret(ExtensionUseExtendedMasterSecret),
     RenegotiationInfo(ExtensionRenegotiationInfo),
+    ConnectionId(ExtensionConnectionId),
 }
 
 impl Extension {
@@ -68,6 +74,7 @@ impl Extension {
             Extension::UseSrtp(ext) => ext.extension_value(),
             Extension::UseExtendedMasterSecret(ext) => ext.extension_value(),
             Extension::RenegotiationInfo(ext) => ext.extension_value(),
+            Extension::ConnectionId(ext) => ext.extension_value(),
         }
     }
 
@@ -82,6 +89,7 @@ impl Extension {
             Extension::UseSrtp(ext) => ext.size(),
             Extension::UseExtendedMasterSecret(ext) => ext.size(),
             Extension::RenegotiationInfo(ext) => ext.size(),
+            Extension::ConnectionId(ext) => ext.size(),
         };
 
         len
@@ -97,6 +105,7 @@ impl Extension {
             Extension::UseSrtp(ext) => ext.marshal(writer),
             Extension::UseExtendedMasterSecret(ext) => ext.marshal(writer),
             Extension::RenegotiationInfo(ext) => ext.marshal(writer),
+            Extension::ConnectionId(ext) => ext.marshal(writer),
         }
     }
 
@@ -123,6 +132,9 @@ impl Extension {
             )),
             ExtensionValue::RenegotiationInfo => Ok(Extension::RenegotiationInfo(
                 ExtensionRenegotiationInfo::unmarshal(reader)?,
+            )),
+            ExtensionValue::ConnectionId => Ok(Extension::ConnectionId(
+                ExtensionConnectionId::unmarshal(reader)?,
             )),
             _ => Err(Error::ErrInvalidExtensionType),
         }
