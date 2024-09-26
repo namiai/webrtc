@@ -15,6 +15,7 @@ use crate::crypto::*;
 use crate::curve::named_curve::*;
 use crate::curve::*;
 use crate::error::Error;
+use crate::extension::extension_connection_id::ExtensionConnectionId;
 use crate::extension::extension_supported_elliptic_curves::*;
 use crate::extension::extension_supported_point_formats::*;
 use crate::extension::extension_use_extended_master_secret::*;
@@ -532,6 +533,17 @@ impl Flight for Flight4 {
             ]);
         }
 
+        // If we have a connection ID generator, we are willing to use connection
+        // IDs. We already know whether the client supports connection IDs from
+        // parsing the ClientHello, so avoid setting local connection ID if the
+        // client won't send it.
+        if let Some(gen) = cfg.connection_id_generator {
+            if state.remote_connection_id.read().await.is_some() {
+                let cid = gen();
+                *state.local_connection_id.write().await = cid.clone().into();
+                extensions.push(Extension::ConnectionId(ExtensionConnectionId { connection_id: cid }))
+            }
+        }
         let mut pkts = vec![Packet {
             record: RecordLayer::new(
                 PROTOCOL_VERSION1_2,
@@ -555,6 +567,7 @@ impl Flight for Flight4 {
             ),
             should_encrypt: false,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: false,
         }];
 
         if cfg.local_psk_callback.is_none() {
@@ -587,6 +600,7 @@ impl Flight for Flight4 {
                 ),
                 should_encrypt: false,
                 reset_local_sequence_number: false,
+                should_wrap_connection_id: false
             });
 
             let mut server_random = vec![];
@@ -659,6 +673,7 @@ impl Flight for Flight4 {
                     ),
                     should_encrypt: false,
                     reset_local_sequence_number: false,
+                should_wrap_connection_id: false,
                 });
             }
 
@@ -679,6 +694,7 @@ impl Flight for Flight4 {
                     ),
                     should_encrypt: false,
                     reset_local_sequence_number: false,
+                    should_wrap_connection_id: false,
                 });
             }
         } else if let Some(local_psk_identity_hint) = &cfg.local_psk_identity_hint {
@@ -707,6 +723,7 @@ impl Flight for Flight4 {
                 ),
                 should_encrypt: false,
                 reset_local_sequence_number: false,
+                should_wrap_connection_id: false,
             });
         }
 
@@ -720,6 +737,7 @@ impl Flight for Flight4 {
             ),
             should_encrypt: false,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: false,
         });
 
         Ok(pkts)
@@ -771,7 +789,7 @@ mod tests {
         fn encrypt(&self, _pkt_rlh: &RecordLayerHeader, _raw: &[u8]) -> Result<Vec<u8>> {
             unimplemented!();
         }
-        fn decrypt(&self, _input: &[u8]) -> Result<Vec<u8>> {
+        fn decrypt(&self, _h: &mut RecordLayerHeader, _input: &[u8]) -> Result<Vec<u8>> {
             unimplemented!();
         }
     }

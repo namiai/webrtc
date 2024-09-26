@@ -11,6 +11,7 @@ use crate::conn::*;
 use crate::content::*;
 use crate::curve::named_curve::*;
 use crate::error::Error;
+use crate::extension::extension_connection_id::ExtensionConnectionId;
 use crate::extension::extension_server_name::*;
 use crate::extension::extension_supported_elliptic_curves::*;
 use crate::extension::extension_supported_point_formats::*;
@@ -170,6 +171,14 @@ impl Flight for Flight1 {
             }));
         }
 
+        // If we have a connection ID generator, use it. The CID may be zero length,
+        // in which case we are just requesting that the server send us a CID to
+        // use.
+        if let Some(gen) = cfg.connection_id_generator {
+            let cid = gen();
+            *state.local_connection_id.write().await = cid.clone().into();
+            extensions.push(Extension::ConnectionId(ExtensionConnectionId { connection_id: cid }));
+        }
         Ok(vec![Packet {
             record: RecordLayer::new(
                 PROTOCOL_VERSION1_2,
@@ -188,6 +197,7 @@ impl Flight for Flight1 {
             ),
             should_encrypt: false,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: false,
         }])
     }
 }

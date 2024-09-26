@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use log::*;
 use portable_atomic::{AtomicBool, AtomicU16};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::Duration;
 use util::replay_detector::*;
 use util::Conn;
@@ -33,6 +33,7 @@ use crate::handshake::handshake_cache::*;
 use crate::handshake::handshake_header::HandshakeHeader;
 use crate::handshake::*;
 use crate::handshaker::*;
+use crate::record_layer::inner_plain_text::InnerPlainText;
 use crate::record_layer::record_layer_header::*;
 use crate::record_layer::*;
 use crate::signature_hash_algorithm::parse_signature_schemes;
@@ -105,6 +106,7 @@ pub struct DTLSConn {
     pub(crate) handshake_done_tx: Option<mpsc::Sender<()>>,
 
     reader_close_tx: Mutex<Option<mpsc::Sender<()>>>,
+    padding_length_generator: fn(usize) -> usize
 }
 
 type UtilResult<T> = std::result::Result<T, util::Error>;
@@ -195,6 +197,8 @@ impl DTLSConn {
             config.replay_protection_window
         };
 
+        let padding_length_generator = config.padding_length_generator;
+
         let mut server_name = config.server_name.clone();
 
         // Use host from conn address when server_name is not provided
@@ -251,6 +255,7 @@ impl DTLSConn {
                 .unwrap(),
             ),
             retransmit_interval,
+            connection_id_generator: config.connection_id_generator,
             //log: logger,
             initial_epoch: 0,
             ..Default::default()
@@ -316,11 +321,13 @@ impl DTLSConn {
             handle_queue_tx,
             handshake_done_tx: Some(handshake_done_tx),
             reader_close_tx: Mutex::new(Some(reader_close_tx)),
+            padding_length_generator
         };
 
         let cipher_suite1 = Arc::clone(&c.state.cipher_suite);
         let sequence_number = Arc::clone(&c.state.local_sequence_number);
-
+        let remote_connection_id = Arc::clone(&c.state.remote_connection_id);
+        let padding_length_generator = c.padding_length_generator;
         tokio::spawn(async move {
             loop {
                 let rx = packet_rx.recv().await;
@@ -335,6 +342,8 @@ impl DTLSConn {
                         &sequence_number,
                         &cipher_suite1,
                         maximum_transmission_unit,
+                        padding_length_generator,
+                        &remote_connection_id
                     )
                     .await;
 
@@ -351,7 +360,8 @@ impl DTLSConn {
         let local_epoch = Arc::clone(&c.state.local_epoch);
         let remote_epoch = Arc::clone(&c.state.remote_epoch);
         let cipher_suite2 = Arc::clone(&c.state.cipher_suite);
-
+        let local_connection_id = Arc::clone(&c.state.local_connection_id);
+        let remote_connection_id = Arc::clone(&c.state.remote_connection_id);
         tokio::spawn(async move {
             let mut buf = vec![0u8; INBOUND_BUFFER_SIZE];
             let mut ctx = ConnReaderContext {
@@ -386,6 +396,8 @@ impl DTLSConn {
                                             &mut buf,
                                             &local_epoch,
                                             &handshake_completed_successfully2,
+                                            &local_connection_id,
+                                            &remote_connection_id
                                         ) => {
                         if let Err(err) = result {
                             trace!(
@@ -482,6 +494,7 @@ impl DTLSConn {
             ),
             should_encrypt: true,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: self.state.remote_connection_id.read().await.as_ref().is_some_and(|cid| cid.len() > 0)
         }];
 
         if let Some(d) = duration {
@@ -544,6 +557,7 @@ impl DTLSConn {
             ),
             should_encrypt: self.is_handshake_completed_successfully(),
             reset_local_sequence_number: false,
+            should_wrap_connection_id: self.state.remote_connection_id.read().await.as_ref().is_some_and(|cid| cid.len() > 0)
         }])
         .await
     }
@@ -562,15 +576,17 @@ impl DTLSConn {
 
     async fn handle_outgoing_packets(
         next_conn: &Arc<dyn util::Conn + Send + Sync>,
-        mut pkts: Vec<Packet>,
+        pkts: Vec<Packet>,
         cache: &mut HandshakeCache,
         is_client: bool,
         local_sequence_number: &Arc<Mutex<Vec<u64>>>,
         cipher_suite: &Arc<Mutex<Option<Box<dyn CipherSuite + Send + Sync>>>>,
         maximum_transmission_unit: usize,
+        padding_length_generator: fn(usize) -> usize,
+        remote_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
     ) -> Result<()> {
         let mut raw_packets = vec![];
-        for p in &mut pkts {
+        for mut p in pkts {
             if let Content::Handshake(h) = &p.record.content {
                 let mut handshake_raw = vec![];
                 {
@@ -594,12 +610,18 @@ impl DTLSConn {
                     )
                     .await;
 
+                // the design of the lib is derived from the go's pion lib
+                // rust borrow checker is not happy with obtaining both mutable and immutable
+                // reference. So, to satisfy it, we have to clone the header value before passing
+                let h = h.clone();
                 let raw_handshake_packets = DTLSConn::process_handshake_packet(
                     local_sequence_number,
                     cipher_suite,
                     maximum_transmission_unit,
-                    p,
-                    h,
+                    &mut p,
+                    &h,
+                    padding_length_generator,
+                    remote_connection_id
                 )
                 .await?;
                 raw_packets.extend_from_slice(&raw_handshake_packets);
@@ -611,7 +633,7 @@ impl DTLSConn {
                 }*/
 
                 let raw_packet =
-                    DTLSConn::process_packet(local_sequence_number, cipher_suite, p).await?;
+                    DTLSConn::process_packet(local_sequence_number, cipher_suite, &mut p, padding_length_generator, remote_connection_id).await?;
                 raw_packets.push(raw_packet);
             }
         }
@@ -632,6 +654,8 @@ impl DTLSConn {
         local_sequence_number: &Arc<Mutex<Vec<u64>>>,
         cipher_suite: &Arc<Mutex<Option<Box<dyn CipherSuite + Send + Sync>>>>,
         p: &mut Packet,
+        padding_length_generator: fn(usize) -> usize,
+        remote_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
     ) -> Result<Vec<u8>> {
         let epoch = p.record.record_layer_header.epoch as usize;
         let seq = {
@@ -654,9 +678,46 @@ impl DTLSConn {
         p.record.record_layer_header.sequence_number = seq;
 
         let mut raw_packet = vec![];
-        {
-            let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_packet.as_mut());
-            p.record.marshal(&mut writer)?;
+        if p.should_wrap_connection_id {
+            let mut raw_content_bytes = vec![];
+            {
+                let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_content_bytes.as_mut());
+                p.record.content.marshal(&mut writer)?;
+
+            }
+            let raw_content_bytes_len = raw_content_bytes.len();
+            let inner = InnerPlainText {
+                content: raw_content_bytes,
+                real_type: p.record.record_layer_header.content_type,
+                zeros: padding_length_generator(raw_content_bytes_len)
+            };
+            let mut raw_inner_bytes = vec![];
+            {
+                let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_inner_bytes.as_mut());
+                inner.marshal(&mut writer)?;
+
+            }
+            let cid_header = RecordLayerHeader {
+                protocol_version: p.record.record_layer_header.protocol_version,
+                content_type: ContentType::ConnectionId,
+                content_len: raw_inner_bytes.len() as u16,
+                epoch: p.record.record_layer_header.epoch,
+                sequence_number: seq,
+                connection_id: remote_connection_id.read().await.clone()
+            };
+            let mut raw_cid_header_bytes = vec![];
+            {
+                let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_cid_header_bytes.as_mut());
+                cid_header.marshal(&mut writer)?;
+            }
+            p.record.record_layer_header = cid_header;
+            raw_packet.append(&mut raw_cid_header_bytes);
+            raw_packet.append(&mut raw_inner_bytes);
+        }  else {
+            {
+                let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_packet.as_mut());
+                p.record.marshal(&mut writer)?;
+            }
         }
 
         if p.should_encrypt {
@@ -673,8 +734,10 @@ impl DTLSConn {
         local_sequence_number: &Arc<Mutex<Vec<u64>>>,
         cipher_suite: &Arc<Mutex<Option<Box<dyn CipherSuite + Send + Sync>>>>,
         maximum_transmission_unit: usize,
-        p: &Packet,
+        p: &mut Packet,
         h: &Handshake,
+        padding_length_generator: fn(usize) -> usize,
+        remote_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
     ) -> Result<Vec<Vec<u8>>> {
         let mut raw_packets = vec![];
 
@@ -697,29 +760,62 @@ impl DTLSConn {
                 return Err(Error::ErrSequenceNumberOverflow);
             }
 
-            let record_layer_header = RecordLayerHeader {
-                protocol_version: p.record.record_layer_header.protocol_version,
-                content_type: p.record.record_layer_header.content_type,
-                content_len: handshake_fragment.len() as u16,
-                epoch: p.record.record_layer_header.epoch,
-                sequence_number: seq,
-            };
-
-            let mut record_layer_header_bytes = vec![];
-            {
-                let mut writer = BufWriter::<&mut Vec<u8>>::new(record_layer_header_bytes.as_mut());
-                record_layer_header.marshal(&mut writer)?;
-            }
-
-            //p.record.record_layer_header = record_layer_header;
-
             let mut raw_packet = vec![];
-            raw_packet.extend_from_slice(&record_layer_header_bytes);
-            raw_packet.extend_from_slice(handshake_fragment);
+            if p.should_wrap_connection_id {
+                let inner = InnerPlainText {
+                    content: handshake_fragment.clone(),
+                    real_type: ContentType::Handshake,
+                    zeros: padding_length_generator(handshake_fragment.len())
+                };
+                let mut raw_inner_bytes = vec![];
+                {
+                    let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_inner_bytes.as_mut());
+                    inner.marshal(&mut writer)?;
+                }
+                let cid_header = RecordLayerHeader {
+                    protocol_version: p.record.record_layer_header.protocol_version,
+                    content_type: ContentType::ConnectionId,
+                    content_len: raw_inner_bytes.len() as u16,
+                    epoch: p.record.record_layer_header.epoch,
+                    sequence_number: p.record.record_layer_header.sequence_number,
+                    connection_id: remote_connection_id.read().await.clone()
+                };
+                let mut raw_cid_header_bytes = vec![];
+                {
+                    let mut writer = BufWriter::<&mut Vec<u8>>::new(raw_cid_header_bytes.as_mut());
+                    cid_header.marshal(&mut writer)?;
+                }
+                p.record.record_layer_header = cid_header;
+                raw_packet.append(&mut raw_cid_header_bytes);
+                raw_packet.append(&mut raw_inner_bytes);
+            } else {
+                let record_layer_header = RecordLayerHeader {
+                    protocol_version: p.record.record_layer_header.protocol_version,
+                    content_type: p.record.record_layer_header.content_type,
+                    content_len: handshake_fragment.len() as u16,
+                    epoch: p.record.record_layer_header.epoch,
+                    sequence_number: seq,
+                    connection_id: None
+                };
+
+                let mut record_layer_header_bytes = vec![];
+                {
+                    let mut writer = BufWriter::<&mut Vec<u8>>::new(record_layer_header_bytes.as_mut());
+                    record_layer_header.marshal(&mut writer)?;
+                }
+
+                p.record.record_layer_header = record_layer_header;
+
+                raw_packet.extend_from_slice(&record_layer_header_bytes);
+                raw_packet.extend_from_slice(handshake_fragment);
+            }
             if p.should_encrypt {
                 let cipher_suite = cipher_suite.lock().await;
                 if let Some(cipher_suite) = &*cipher_suite {
-                    raw_packet = cipher_suite.encrypt(&record_layer_header, &raw_packet)?;
+                    raw_packet = cipher_suite.encrypt(
+                        &p.record.record_layer_header,
+                        &raw_packet
+                    )?;
                 }
             }
 
@@ -790,12 +886,14 @@ impl DTLSConn {
         buf: &mut [u8],
         local_epoch: &Arc<AtomicU16>,
         handshake_completed_successfully: &Arc<AtomicBool>,
+        local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>,
+        remote_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
     ) -> Result<()> {
         let n = next_conn.recv(buf).await?;
-        let pkts = unpack_datagram(&buf[..n])?;
+        let pkts = content_aware_unpack_datagram(&buf[..n], local_connection_id.read().await.as_ref().map_or(0, |l| l.len()))?;
         let mut has_handshake = false;
         for pkt in pkts {
-            let (hs, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, pkt, true).await;
+            let (hs, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, pkt, true, local_connection_id).await;
             if let Some(alert) = alert {
                 let alert_err = ctx
                     .packet_tx
@@ -811,6 +909,7 @@ impl DTLSConn {
                             ),
                             should_encrypt: handshake_completed_successfully.load(Ordering::SeqCst),
                             reset_local_sequence_number: false,
+                            should_wrap_connection_id: remote_connection_id.read().await.as_ref().is_some_and(|cid| cid.len() > 0)
                         }],
                         None,
                     ))
@@ -857,7 +956,7 @@ impl DTLSConn {
                                 //trace!("recv handle_queue: {} ", srv_cli_str(ctx.is_client));
 
                                 let pkts = ctx.encrypted_packets.drain(..).collect();
-                                DTLSConn::handle_queued_packets(ctx, local_epoch, handshake_completed_successfully, pkts).await?;
+                                DTLSConn::handle_queued_packets(ctx, local_epoch, handshake_completed_successfully, pkts, remote_connection_id, local_connection_id).await?;
 
                                 drop(done);
                             }
@@ -875,9 +974,11 @@ impl DTLSConn {
         local_epoch: &Arc<AtomicU16>,
         handshake_completed_successfully: &Arc<AtomicBool>,
         pkts: Vec<Vec<u8>>,
+        remote_connection_id: &Arc<RwLock<Option<Vec<u8>>>>,
+        local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
     ) -> Result<()> {
         for p in pkts {
-            let (_, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, p, false).await; // don't re-enqueue
+            let (_, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, p, false, local_connection_id).await; // don't re-enqueue
             if let Some(alert) = alert {
                 let alert_err = ctx
                     .packet_tx
@@ -893,6 +994,7 @@ impl DTLSConn {
                             ),
                             should_encrypt: handshake_completed_successfully.load(Ordering::SeqCst),
                             reset_local_sequence_number: false,
+                            should_wrap_connection_id: remote_connection_id.read().await.as_ref().is_some_and(|cid| cid.len() > 0)
                         }],
                         None,
                     ))
@@ -922,21 +1024,25 @@ impl DTLSConn {
         ctx: &mut ConnReaderContext,
         mut pkt: Vec<u8>,
         enqueue: bool,
+        local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
     ) -> (bool, Option<Alert>, Option<Error>) {
         let mut reader = BufReader::new(pkt.as_slice());
-        let h = match RecordLayerHeader::unmarshal(&mut reader) {
-            Ok(h) => h,
-            Err(err) => {
-                // Decode error must be silently discarded
-                // [RFC6347 Section-4.1.2.7]
-                debug!(
-                    "{}: discarded broken packet: {}",
-                    srv_cli_str(ctx.is_client),
-                    err
-                );
-                return (false, None, None);
+        let mut h = RecordLayerHeader::new();
+        if let Some(local_connection_id_len) = local_connection_id.read().await.as_ref().map(|cid| cid.len()) {
+            if local_connection_id_len > 0 {
+                h.connection_id = vec![0u8; local_connection_id_len].into();
             }
-        };
+        }
+        if let Err(err) = h.unmarshal(&mut reader) {
+            // Decode error must be silently discarded
+            // [RFC6347 Section-4.1.2.7]
+            debug!(
+                "{}: discarded broken packet: {}",
+                srv_cli_str(ctx.is_client),
+                err
+            );
+            return (false, None, None);
+        }
 
         // Validate epoch
         let epoch = ctx.remote_epoch.load(Ordering::SeqCst);
@@ -963,10 +1069,10 @@ impl DTLSConn {
         // Anti-replay protection
         while ctx.replay_detector.len() <= h.epoch as usize {
             ctx.replay_detector
-                .push(Box::new(SlidingWindowDetector::new(
-                    ctx.replay_protection_window,
-                    MAX_SEQUENCE_NUMBER,
-                )));
+               .push(Box::new(SlidingWindowDetector::new(
+                   ctx.replay_protection_window,
+                   MAX_SEQUENCE_NUMBER,
+               )));
         }
 
         let ok = ctx.replay_detector[h.epoch as usize].check(h.sequence_number);
@@ -979,6 +1085,9 @@ impl DTLSConn {
             );
             return (false, None, None);
         }
+
+        // original_cid indicates the original record had content type ConnectionId
+        let mut original_cid = false;
 
         // Decrypt
         if h.epoch != 0 {
@@ -1003,9 +1112,23 @@ impl DTLSConn {
                 return (false, None, None);
             }
 
+
+            // If a connection identifier had been negotiated and encryption is
+            // enabled, the connection identifier MUST be sent.
+            let local_connection_id_len = local_connection_id.read().await.as_ref().map_or(0, |cid| cid.len());
+            if local_connection_id_len > 0 && h.content_type != ContentType::ConnectionId {
+                debug!("{}: discarded packet missing connection ID after value negotiated",
+                       srv_cli_str(ctx.is_client)
+                );
+                return (false, None, None)
+            }
+
+            if h.content_type == ContentType::ConnectionId {
+                h.connection_id = vec![0u8; local_connection_id_len].into()
+            }
             let cipher_suite = ctx.cipher_suite.lock().await;
             if let Some(cipher_suite) = &*cipher_suite {
-                pkt = match cipher_suite.decrypt(&pkt) {
+                pkt = match cipher_suite.decrypt(&mut h, &pkt) {
                     Ok(pkt) => pkt,
                     Err(err) => {
                         debug!("{}: decrypt failed: {}", srv_cli_str(ctx.is_client), err);
@@ -1025,6 +1148,42 @@ impl DTLSConn {
                         }
                     }
                 };
+            }
+
+            // If this is a connection ID record, make it look like a normal record for
+            // further processing.
+            if h.content_type == ContentType::ConnectionId {
+                original_cid = true;
+                let ip = match InnerPlainText::unmarshal(&pkt[h.size()..]) {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        debug!("{}: unpacking inner plaintext failed: {}", srv_cli_str(ctx.is_client), e);
+                            return (false, None, None);
+                    }
+                };
+                let unpacked = RecordLayerHeader {
+                    content_type: ip.real_type,
+                    content_len: ip.content.len() as u16,
+                    protocol_version: h.protocol_version,
+                    epoch: h.epoch,
+                    sequence_number: h.sequence_number,
+                    connection_id: None,
+                };
+                let mut unpacked_raw = vec![];
+                {
+                    let mut writer = BufWriter::<&mut Vec<u8>>::new(unpacked_raw.as_mut());
+                    if let Err(e) = unpacked.marshal(&mut writer) {
+                        debug!("{}: error marshalling plain text from connection id: {}", srv_cli_str(ctx.is_client), e);
+                        return (false, None, None)
+                    };
+                }
+                unpacked_raw.extend_from_slice(&ip.content);
+
+                pkt = unpacked_raw;
+            }
+            if local_connection_id.read().await.as_ref().unwrap_or(&vec![]) != h.connection_id.as_ref().unwrap_or(&vec![]) {
+                debug!("{}: unexpected connection id", srv_cli_str(ctx.is_client));
+                return (false, None, None)
             }
         }
 
@@ -1064,14 +1223,14 @@ impl DTLSConn {
                 };
 
                 ctx.cache
-                    .push(
-                        out,
-                        epoch,
-                        raw_handshake.handshake_header.message_sequence,
-                        raw_handshake.handshake_header.handshake_type,
-                        !ctx.is_client,
-                    )
-                    .await;
+                   .push(
+                       out,
+                       epoch,
+                       raw_handshake.handshake_header.message_sequence,
+                       raw_handshake.handshake_header.handshake_type,
+                       !ctx.is_client,
+                   )
+                   .await;
             }
 
             return (true, None, None);
@@ -1091,7 +1250,7 @@ impl DTLSConn {
                 );
             }
         };
-
+        let mut is_latest_seq_num = false;
         match r.content {
             Content::Alert(mut a) => {
                 trace!("{}: <- {}", srv_cli_str(ctx.is_client), a.to_string());
@@ -1142,6 +1301,7 @@ impl DTLSConn {
                 if epoch + 1 == new_remote_epoch {
                     ctx.remote_epoch.store(new_remote_epoch, Ordering::SeqCst);
                     ctx.replay_detector[h.epoch as usize].accept();
+                    is_latest_seq_num = true;
                 }
             }
             Content::ApplicationData(a) => {
@@ -1158,12 +1318,14 @@ impl DTLSConn {
 
                 ctx.replay_detector[h.epoch as usize].accept();
 
+                is_latest_seq_num = true;
+
                 let _ = ctx.decrypted_tx.send(Ok(a.data)).await;
                 //TODO
                 /*select {
-                    case self.decrypted < - content.data:
-                    case < -c.closed.Done():
-                }*/
+                case self.decrypted < - content.data:
+                case < -c.closed.Done():
+            }*/
             }
             _ => {
                 return (
@@ -1177,6 +1339,12 @@ impl DTLSConn {
             }
         };
 
+        // Any valid connection ID record is a candidate for updating the remote
+        // address if it is the latest record received.
+        // https://datatracker.ietf.org/doc/html/rfc9146#peer-address-update
+        // if original_cid && is_latest_seq_num {
+
+        // }
         (false, None, None)
     }
 

@@ -56,6 +56,7 @@ pub(crate) struct Packet {
     pub(crate) record: RecordLayer,
     pub(crate) should_encrypt: bool,
     pub(crate) reset_local_sequence_number: bool,
+    pub(crate) should_wrap_connection_id: bool
 }
 
 #[async_trait]

@@ -82,6 +82,7 @@ impl Flight for Flight6 {
             ),
             should_encrypt: false,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: false,
         }];
 
         if state.local_verify_data.is_empty() {
@@ -183,6 +184,7 @@ impl Flight for Flight6 {
             ),
             should_encrypt: true,
             reset_local_sequence_number: true,
+            should_wrap_connection_id: state.remote_connection_id.read().await.as_ref().is_some_and(|cid| cid.len() > 0)
         });
 
         Ok(pkts)

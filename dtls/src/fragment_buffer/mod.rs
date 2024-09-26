@@ -46,7 +46,8 @@ impl FragmentBuffer {
         }
 
         let mut reader = Cursor::new(buf);
-        let record_layer_header = RecordLayerHeader::unmarshal(&mut reader)?;
+        let mut record_layer_header = RecordLayerHeader::new();
+        record_layer_header.unmarshal(&mut reader)?;
 
         // Fragment isn't a handshake, we don't need to handle it
         if record_layer_header.content_type != ContentType::Handshake {
@@ -57,7 +58,6 @@ impl FragmentBuffer {
         while !buf.is_empty() {
             let mut reader = Cursor::new(buf);
             let handshake_header = HandshakeHeader::unmarshal(&mut reader)?;
-
             self.cache
                 .entry(handshake_header.message_sequence)
                 .or_default();
@@ -74,7 +74,7 @@ impl FragmentBuffer {
 
             if let Some(x) = self.cache.get_mut(&handshake_header.message_sequence) {
                 x.push(Fragment {
-                    record_layer_header,
+                    record_layer_header: record_layer_header.clone(),
                     handshake_header,
                     data,
                 });

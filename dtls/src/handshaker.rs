@@ -98,6 +98,7 @@ pub(crate) struct HandshakeConfig {
     pub(crate) initial_epoch: u16,
     //log           logging.LeveledLogger
     //mu sync.Mutex
+    pub(crate) connection_id_generator: Option<fn() -> Vec<u8>>
 }
 
 pub fn gen_self_signed_root_cert() -> rustls::RootCertStore {
@@ -138,6 +139,7 @@ impl Default for HandshakeConfig {
             client_cert_verifier: None,
             retransmit_interval: tokio::time::Duration::from_secs(0),
             initial_epoch: 0,
+            connection_id_generator: None
         }
     }
 }

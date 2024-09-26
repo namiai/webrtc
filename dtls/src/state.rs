@@ -1,12 +1,12 @@
 use std::io::{BufWriter, Cursor};
 use std::marker::{Send, Sync};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{Ordering, AtomicPtr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use portable_atomic::AtomicU16;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use util::{KeyingMaterialExporter, KeyingMaterialExporterError};
 
 use super::cipher_suite::*;
@@ -48,6 +48,18 @@ pub struct State {
     pub(crate) local_key_signature: Vec<u8>,       // cached keySignature
     pub(crate) peer_certificates_verified: bool,
     //pub(crate) replay_detector: Vec<Box<dyn ReplayDetector + Send + Sync>>,
+
+    // local_connection_id is the locally generated connection ID that is expected
+    // to be received from the remote endpoint.
+    // For a server, this is the connection ID sent in ServerHello.
+    // For a client, this is the connection ID sent in the ClientHello.
+    pub(crate) local_connection_id: Arc<RwLock<Option<Vec<u8>>>>,
+    // remoteConnectionID is the connection ID that the remote endpoint
+    // specifies should be sent.
+    // For a server, this is the connection ID received in the ClientHello.
+    // For a client, this is the connection ID received in the ServerHello.
+    pub(crate) remote_connection_id: Arc<RwLock<Option<Vec<u8>>>>
+
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -97,6 +109,8 @@ impl Default for State {
             local_key_signature: vec![],         // cached keySignature
             peer_certificates_verified: false,
             //replay_detector: vec![],
+            local_connection_id: Arc::new(RwLock::new(None)),
+            remote_connection_id: Arc::new(RwLock::new(None))
         }
     }
 }

@@ -114,7 +114,7 @@ fn test_ccm_encryption_and_decryption() -> Result<()> {
 
     let ccm = CryptoCcm::new(&CryptoCcmTagLen::CryptoCcmTagLength, &key, &iv, &key, &iv);
 
-    let rlh = RecordLayerHeader {
+    let mut rlh = RecordLayerHeader {
         content_type: ContentType::ApplicationData,
         protocol_version: ProtocolVersion {
             major: 0xfe,
@@ -123,6 +123,7 @@ fn test_ccm_encryption_and_decryption() -> Result<()> {
         epoch: 0,
         sequence_number: 18,
         content_len: 3,
+        connection_id: None,
     };
 
     let raw = vec![
@@ -140,7 +141,7 @@ fn test_ccm_encryption_and_decryption() -> Result<()> {
         &cipher_text[RECORD_LAYER_HEADER_SIZE - 2..RECORD_LAYER_HEADER_SIZE]
     );
 
-    let plain_text = ccm.decrypt(&cipher_text)?;
+    let plain_text = ccm.decrypt(&mut rlh, &cipher_text)?;
 
     assert_eq!(
         raw[RECORD_LAYER_HEADER_SIZE..],

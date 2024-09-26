@@ -100,6 +100,26 @@ pub struct Config {
     /// Packet with sequence number older than this value compared to the latest
     /// accepted packet will be discarded. (default is 64)
     pub replay_protection_window: usize,
+
+    // connection_id_generator generates connection identifiers that should be
+    // sent by the remote party if it supports the DTLS Connection Identifier
+    // extension, as determined during the handshake. Generated connection
+    // identifiers must always have the same length. Returning a zero-length
+    // connection identifier indicates that the local party supports sending
+    // connection identifiers but does not require the remote party to send
+    // them. A None connection_id_generator indicates that connection identifiers
+    // are not supported.
+    // https://datatracker.ietf.org/doc/html/rfc9146
+    pub connection_id_generator: Option<fn() -> Vec<u8>>,
+
+    // padding_length_generator generates the number of padding bytes used to
+    // inflate ciphertext size in order to obscure content size from observers.
+    // The length of the content is passed to the generator such that both
+    // deterministic and random padding schemes can be applied while not
+    // exceeding maximum record size.
+    // If no padding_length_generator is specified, padding will not be applied.
+    // https://datatracker.ietf.org/doc/html/rfc9146#section-4
+    pub padding_length_generator: fn(usize) -> usize,
 }
 
 impl Default for Config {
@@ -123,6 +143,8 @@ impl Default for Config {
             server_name: String::default(),
             mtu: 0,
             replay_protection_window: 0,
+            padding_length_generator: { |_| 0 },
+            connection_id_generator: Some(|| vec![]),
         }
     }
 }

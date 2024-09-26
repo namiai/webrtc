@@ -126,6 +126,7 @@ impl Flight for Flight2 {
             ),
             should_encrypt: false,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: false,
         }])
     }
 }

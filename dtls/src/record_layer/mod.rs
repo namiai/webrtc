@@ -1,3 +1,4 @@
+pub mod inner_plain_text;
 pub mod record_layer_header;
 
 #[cfg(test)]
@@ -49,6 +50,7 @@ impl RecordLayer {
                 epoch,
                 sequence_number: 0,
                 content_len: content.size() as u16,
+                connection_id: None,
             },
             content,
         }
@@ -61,7 +63,8 @@ impl RecordLayer {
     }
 
     pub fn unmarshal<R: Read>(reader: &mut R) -> Result<Self> {
-        let record_layer_header = RecordLayerHeader::unmarshal(reader)?;
+        let mut record_layer_header = RecordLayerHeader::new();
+        record_layer_header.unmarshal(reader)?;
         let content = match record_layer_header.content_type {
             ContentType::Alert => Content::Alert(Alert::unmarshal(reader)?),
             ContentType::ApplicationData => {
@@ -99,6 +102,38 @@ pub(crate) fn unpack_datagram(buf: &[u8]) -> Result<Vec<Vec<u8>>> {
         let pkt_len = RECORD_LAYER_HEADER_SIZE
             + (((buf[offset + RECORD_LAYER_HEADER_SIZE - 2] as usize) << 8)
                 | buf[offset + RECORD_LAYER_HEADER_SIZE - 1] as usize);
+        if offset + pkt_len > buf.len() {
+            return Err(Error::ErrInvalidPacketLength);
+        }
+
+        out.push(buf[offset..offset + pkt_len].to_vec());
+        offset += pkt_len
+    }
+
+    Ok(out)
+}
+
+pub(crate) fn content_aware_unpack_datagram(
+    buf: &[u8],
+    connection_id_len: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let mut out = vec![];
+
+    let mut offset = 0;
+    while buf.len() != offset {
+        let mut header_size = RECORD_LAYER_HEADER_SIZE;
+        let mut len_idx = RECORD_LAYER_HEADER_LEN_IDX;
+
+        if ContentType::from(buf[offset]) == ContentType::ConnectionId {
+            header_size += connection_id_len;
+            len_idx += connection_id_len;
+        }
+        if buf.len() - offset <= header_size {
+            return Err(Error::ErrInvalidPacketLength);
+        }
+
+        let pkt_len = header_size
+            + (((buf[offset + len_idx] as usize) << 8) | buf[offset + len_idx + 1] as usize);
         if offset + pkt_len > buf.len() {
             return Err(Error::ErrInvalidPacketLength);
         }

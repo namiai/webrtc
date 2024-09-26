@@ -275,6 +275,7 @@ async fn test_sequence_number_overflow_on_handshake() -> Result<()> {
             ),
             should_encrypt: false,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: false
         }])
         .await
     {
@@ -437,6 +438,7 @@ async fn test_export_keying_material() -> Result<()> {
         handshake_done_tx: None,
 
         reader_close_tx: Mutex::new(None),
+        padding_length_generator: { |_| 0 }
     };
 
     c.set_local_epoch(0);
@@ -2087,7 +2089,8 @@ async fn test_protocol_version_validation() -> Result<()> {
             }
 
             let mut reader = BufReader::new(&resp[..n]);
-            let h = RecordLayerHeader::unmarshal(&mut reader)?;
+            let mut h = RecordLayerHeader::new();
+            h.unmarshal(&mut reader)?;
             assert_eq!(
                 h.content_type,
                 ContentType::Alert,
@@ -2228,7 +2231,8 @@ async fn test_protocol_version_validation() -> Result<()> {
             let n = ca.recv(&mut resp).await?;
 
             let mut reader = BufReader::new(&resp[..n]);
-            let h = RecordLayerHeader::unmarshal(&mut reader)?;
+            let mut h = RecordLayerHeader::new();
+            h.unmarshal(&mut reader)?;
 
             assert_eq!(
                 h.content_type,

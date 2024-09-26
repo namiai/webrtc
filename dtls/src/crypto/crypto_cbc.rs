@@ -51,20 +51,34 @@ impl CryptoCbc {
     }
 
     pub fn encrypt(&self, pkt_rlh: &RecordLayerHeader, raw: &[u8]) -> Result<Vec<u8>> {
-        let mut payload = raw[RECORD_LAYER_HEADER_SIZE..].to_vec();
-        let raw = &raw[..RECORD_LAYER_HEADER_SIZE];
+        let mut payload = raw[pkt_rlh.size()..].to_vec();
+        let raw = &raw[..pkt_rlh.size()];
 
         // Generate + Append MAC
         let h = pkt_rlh;
 
-        let mac = prf_mac(
-            h.epoch,
-            h.sequence_number,
-            h.content_type,
-            h.protocol_version,
-            &payload,
-            &self.write_mac,
-        )?;
+        let mac = if pkt_rlh.content_type == ContentType::ConnectionId {
+            prf_mac_cid(
+                h.epoch,
+                h.sequence_number,
+                h.content_type,
+                h.protocol_version,
+                &payload,
+                &self.write_mac,
+                &h.connection_id
+                    .as_ref()
+                    .ok_or(Error::ErrInvalidContentType)?,
+            )?
+        } else {
+            prf_mac(
+                h.epoch,
+                h.sequence_number,
+                h.content_type,
+                h.protocol_version,
+                &payload,
+                &self.write_mac,
+            )?
+        };
         payload.extend_from_slice(&mac);
 
         let mut iv: Vec<u8> = vec![0; Self::BLOCK_SIZE];
@@ -79,22 +93,21 @@ impl CryptoCbc {
         r.extend_from_slice(&iv);
         r.extend_from_slice(&encrypted);
 
-        let r_len = (r.len() - RECORD_LAYER_HEADER_SIZE) as u16;
-        r[RECORD_LAYER_HEADER_SIZE - 2..RECORD_LAYER_HEADER_SIZE]
-            .copy_from_slice(&r_len.to_be_bytes());
+        let r_len = (r.len() - pkt_rlh.size()) as u16;
+        r[pkt_rlh.size() - 2..pkt_rlh.size()].copy_from_slice(&r_len.to_be_bytes());
 
         Ok(r)
     }
 
-    pub fn decrypt(&self, r: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt(&self, h: &mut RecordLayerHeader, r: &[u8]) -> Result<Vec<u8>> {
         let mut reader = Cursor::new(r);
-        let h = RecordLayerHeader::unmarshal(&mut reader)?;
+        h.unmarshal(&mut reader)?;
         if h.content_type == ContentType::ChangeCipherSpec {
             // Nothing to encrypt with ChangeCipherSpec
             return Ok(r.to_vec());
         }
 
-        let body = &r[RECORD_LAYER_HEADER_SIZE..];
+        let body = &r[h.size()..];
         let iv = &body[0..Self::BLOCK_SIZE];
         let body = &body[Self::BLOCK_SIZE..];
         //TODO: add body.len() check
@@ -107,21 +120,37 @@ impl CryptoCbc {
 
         let recv_mac = &decrypted[decrypted.len() - Self::MAC_SIZE..];
         let decrypted = &decrypted[0..decrypted.len() - Self::MAC_SIZE];
-        let mac = prf_mac(
-            h.epoch,
-            h.sequence_number,
-            h.content_type,
-            h.protocol_version,
-            decrypted,
-            &self.read_mac,
-        )?;
+        let mac = if h.content_type == ContentType::ConnectionId {
+            let connection_id = h
+                .connection_id
+                .as_ref()
+                .ok_or(Error::ErrInvalidContentType)?;
+            prf_mac_cid(
+                h.epoch,
+                h.sequence_number,
+                h.content_type,
+                h.protocol_version,
+                decrypted,
+                &self.read_mac,
+                &connection_id,
+            )?
+        } else {
+            prf_mac(
+                h.epoch,
+                h.sequence_number,
+                h.content_type,
+                h.protocol_version,
+                decrypted,
+                &self.read_mac,
+            )?
+        };
 
         if recv_mac.ct_eq(&mac).not().into() {
             return Err(Error::ErrInvalidMac);
         }
 
-        let mut d = Vec::with_capacity(RECORD_LAYER_HEADER_SIZE + decrypted.len());
-        d.extend_from_slice(&r[..RECORD_LAYER_HEADER_SIZE]);
+        let mut d = Vec::with_capacity(h.size() + decrypted.len());
+        d.extend_from_slice(&r[..h.size()]);
         d.extend_from_slice(decrypted);
 
         Ok(d)

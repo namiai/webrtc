@@ -84,9 +84,9 @@ impl CipherSuite for CipherSuiteTlsPskWithAes128GcmSha256 {
         }
     }
 
-    fn decrypt(&self, input: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt(&self, h: &mut RecordLayerHeader, input: &[u8]) -> Result<Vec<u8>> {
         if let Some(cg) = &self.gcm {
-            cg.decrypt(input)
+            cg.decrypt(h, input)
         } else {
             Err(Error::Other(
                 "CipherSuite has not been initialized, unable to decrypt".to_owned(),

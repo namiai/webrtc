@@ -106,9 +106,9 @@ impl CipherSuite for CipherSuiteAes128Ccm {
         }
     }
 
-    fn decrypt(&self, input: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt(&self, h: &mut RecordLayerHeader, input: &[u8]) -> Result<Vec<u8>> {
         if let Some(ccm) = &self.ccm {
-            ccm.decrypt(input)
+            ccm.decrypt(h, input)
         } else {
             Err(Error::Other(
                 "CipherSuite has not been initialized, unable to decrypt".to_owned(),

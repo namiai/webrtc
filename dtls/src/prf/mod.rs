@@ -13,8 +13,10 @@ type HmacSha1 = Hmac<Sha1>;
 
 use crate::cipher_suite::CipherSuiteHash;
 use crate::content::ContentType;
+use crate::crypto::SEQ_NUM_PLACEHOLDER;
 use crate::curve::named_curve::*;
 use crate::error::*;
+use crate::record_layer::inner_plain_text::InnerPlainText;
 use crate::record_layer::record_layer_header::ProtocolVersion;
 
 pub(crate) const PRF_MASTER_SECRET_LABEL: &str = "master secret";
@@ -306,6 +308,42 @@ pub(crate) fn prf_mac(
     msg[9] = protocol_version.major;
     msg[10] = protocol_version.minor;
     msg[11..].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+
+    hmac.update(&msg);
+    hmac.update(payload);
+    let result = hmac.finalize();
+
+    Ok(result.into_bytes().to_vec())
+}
+
+pub(crate) fn prf_mac_cid(
+    epoch: u16,
+    sequence_number: u64,
+    content_type: ContentType,
+    protocol_version: ProtocolVersion,
+    payload: &[u8],
+    key: &[u8],
+    cid: &[u8],
+) -> Result<Vec<u8>> {
+    let ipt = InnerPlainText::unmarshal(payload)?;
+    let mut hmac = HmacSha1::new_from_slice(key).map_err(|e| Error::Other(e.to_string()))?;
+
+    let mut msg = vec![0u8; 19];
+    // 8 bytes of 0xff.
+    // https://datatracker.ietf.org/doc/html/rfc9146#name-record-payload-protection
+    msg[..8].copy_from_slice(SEQ_NUM_PLACEHOLDER.to_be_bytes().as_ref());
+    msg[8] = content_type as u8;
+    msg[9] = cid.len() as u8;
+    msg[10] = content_type as u8;
+    msg[10] = protocol_version.major;
+    msg[11] = protocol_version.minor;
+    msg[11..13].copy_from_slice(&epoch.to_be_bytes());
+    msg[13..19].copy_from_slice(&sequence_number.to_be_bytes()[2..]);
+    msg.append(&mut cid.to_vec());
+    msg.append(&mut (payload.len() as u16).to_be_bytes().to_vec());
+    msg.append(&mut payload.to_vec());
+    msg.push(ipt.real_type as u8);
+    msg.append(&mut vec![0; ipt.zeros]);
 
     hmac.update(&msg);
     hmac.update(payload);

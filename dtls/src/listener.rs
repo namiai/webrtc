@@ -43,8 +43,9 @@ pub fn create_dtls_listen_config() -> ListenConfig {
                 };
 
                 let mut reader = BufReader::new(pkts[0].as_slice());
-                match RecordLayerHeader::unmarshal(&mut reader) {
-                    Ok(h) => {
+                let mut h = RecordLayerHeader::new();
+                match h.unmarshal(&mut reader) {
+                    Ok(_) => {
                         let content_type = h.content_type;
                         Box::pin(async move { content_type == ContentType::Handshake })
                     }
@@ -65,12 +66,13 @@ pub fn create_dtls_listen_config() -> ListenConfig {
                 };
 
                 let mut reader = BufReader::new(pkts[0].as_slice());
+                let mut h = RecordLayerHeader::new();
                 match (
-                    RecordLayerHeader::unmarshal(&mut reader),
+                    h.unmarshal(&mut reader),
                     HandshakeHeader::unmarshal(&mut reader),
                     HandshakeMessageClientHello::unmarshal(&mut reader),
                 ) {
-                    (Ok(h), Ok(hh), Ok(ch)) => {
+                    (Ok(_), Ok(hh), Ok(ch)) => {
                         let epoch = h.epoch;
                         let content_type = h.content_type;
                         let handshake_type = hh.handshake_type;

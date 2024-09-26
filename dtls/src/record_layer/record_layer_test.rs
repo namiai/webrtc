@@ -89,6 +89,7 @@ fn test_record_layer_round_trip() -> Result<()> {
                 epoch: 0,
                 sequence_number: 18,
                 content_len: 1,
+                connection_id: None,
             },
             content: Content::ChangeCipherSpec(ChangeCipherSpec {}),
         },

@@ -132,7 +132,7 @@ pub trait CipherSuite {
     ) -> Result<()>;
 
     fn encrypt(&self, pkt_rlh: &RecordLayerHeader, raw: &[u8]) -> Result<Vec<u8>>;
-    fn decrypt(&self, input: &[u8]) -> Result<Vec<u8>>;
+    fn decrypt(&self, h: &mut RecordLayerHeader, input: &[u8]) -> Result<Vec<u8>>;
 }
 
 // Taken from https://www.iana.org/assignments/tls-parameters/tls-parameters.xml

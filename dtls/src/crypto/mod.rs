@@ -20,10 +20,13 @@ use rcgen::{generate_simple_self_signed, CertifiedKey, KeyPair};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, Ed25519KeyPair};
 
+use crate::content::ContentType;
 use crate::curve::named_curve::*;
 use crate::error::*;
 use crate::record_layer::record_layer_header::*;
 use crate::signature_hash_algorithm::{HashAlgorithm, SignatureAlgorithm, SignatureHashAlgorithm};
+
+pub(crate) const SEQ_NUM_PLACEHOLDER: u64 = 0xffffffffffffffffu64;
 
 /// A X.509 certificate(s) used to authenticate a DTLS connection.
 #[derive(Clone, PartialEq, Debug)]
@@ -508,8 +511,33 @@ pub(crate) fn generate_aead_additional_data(h: &RecordLayerHeader, payload_len: 
     additional_data
 }
 
+pub(crate) fn generate_aead_additional_data_cid(
+    h: &RecordLayerHeader,
+    payload_len: usize,
+) -> Vec<u8> {
+    let mut additional_data = vec![0u8; 21];
+    // 8 bytes of 0xff.
+    // https://datatracker.ietf.org/doc/html/rfc9146#name-record-payload-protection
+    additional_data[..8].copy_from_slice(SEQ_NUM_PLACEHOLDER.to_be_bytes().as_ref());
+    additional_data[8] = ContentType::ConnectionId as u8;
+    additional_data[9] = h.connection_id.as_ref().unwrap().len() as u8;
+    additional_data[10] = ContentType::ConnectionId as u8;
+    additional_data[11] = h.protocol_version.major;
+    additional_data[12] = h.protocol_version.minor;
+    additional_data[13..15].copy_from_slice(&h.epoch.to_be_bytes());
+    additional_data[15..21].copy_from_slice(&h.sequence_number.to_be_bytes()[2..]);
+    additional_data.append(&mut h.connection_id.as_ref().unwrap().to_vec());
+    additional_data.append(&mut (payload_len as u16).to_be_bytes().to_vec());
+
+    additional_data
+}
+
 #[cfg(test)]
 mod test {
+    use crate::content::ContentType;
+    use crate::crypto::generate_aead_additional_data_cid;
+    use crate::record_layer::record_layer_header::{ProtocolVersion, RecordLayerHeader};
+
     #[cfg(feature = "pem")]
     use super::*;
 
@@ -524,5 +552,51 @@ mod test {
         assert_eq!(loaded_cert, cert);
 
         Ok(())
+    }
+    #[test]
+    fn test_generate_aead_additional_data_cid() {
+        let header = RecordLayerHeader {
+            content_type: ContentType::Handshake,
+            protocol_version: ProtocolVersion {
+                major: 0xfe,
+                minor: 0xfd,
+            },
+            epoch: 2,
+            sequence_number: 277,
+            content_len: 0,
+            connection_id: Some(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+        let payload_len = 1784;
+        let expected = vec![
+            255, 255, 255, 255, 255, 255, 255, 255, 25, 8, 25, 254, 253, 0, 2, 0, 0, 0, 0, 1, 21,
+            1, 2, 3, 4, 5, 6, 7, 8, 6, 248,
+        ];
+        let data = generate_aead_additional_data_cid(&header, payload_len);
+        assert_eq!(
+            data, expected,
+            "Should successfully generate additional data with valid header"
+        );
+
+        let header = RecordLayerHeader {
+            content_type: ContentType::Alert,
+            protocol_version: ProtocolVersion {
+                major: 0xfe,
+                minor: 0xfd,
+            },
+            epoch: 2,
+            sequence_number: 277,
+            content_len: 0,
+            connection_id: Some(vec![1, 2, 3, 4, 5, 6, 7, 8]),
+        };
+        let payload_len = 1784;
+        let expected = vec![
+            255, 255, 255, 255, 255, 255, 255, 255, 25, 8, 25, 254, 253, 0, 2, 0, 0, 0, 0, 1, 21,
+            1, 2, 3, 4, 5, 6, 7, 8, 6, 248,
+        ];
+        let data = generate_aead_additional_data_cid(&header, payload_len);
+        assert_eq!(
+            data, expected,
+            "Should use Connection ID content type regardless of header content type."
+        );
     }
 }

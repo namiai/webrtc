@@ -11,6 +11,7 @@ use crate::config::*;
 use crate::content::*;
 use crate::curve::named_curve::*;
 use crate::error::Error;
+use crate::extension::extension_connection_id::ExtensionConnectionId;
 use crate::extension::extension_server_name::*;
 use crate::extension::extension_supported_elliptic_curves::*;
 use crate::extension::extension_supported_point_formats::*;
@@ -216,10 +217,22 @@ impl Flight for Flight3 {
                             state.extended_master_secret = true;
                         }
                     }
+                    Extension::ConnectionId(cid) => {
+                        // Only set connection ID to be sent if client supports connection
+                        // IDs.
+                        if cfg.connection_id_generator.is_some() {
+                            *state.remote_connection_id.write().await = cid.connection_id.clone().into();
+                        }
+                    }
                     _ => {}
                 };
             }
 
+            // If the server doesn't support connection IDs, the client should not
+            // expect one to be sent.
+            if state.remote_connection_id.read().await.is_none() {
+                *state.local_connection_id.write().await = None;
+            }
             if cfg.extended_master_secret == ExtendedMasterSecretType::Require
                 && !state.extended_master_secret
             {
@@ -388,6 +401,11 @@ impl Flight for Flight3 {
                 server_name: cfg.server_name.clone(),
             }));
         }
+        // If we sent a connection ID on the first ClientHello, send it on the
+        // second.
+        if let Some(local_connection_id) = state.local_connection_id.read().await.as_ref() {
+            extensions.push(Extension::ConnectionId(ExtensionConnectionId { connection_id: local_connection_id.clone() }))
+        }
 
         Ok(vec![Packet {
             record: RecordLayer::new(
@@ -407,6 +425,7 @@ impl Flight for Flight3 {
             ),
             should_encrypt: false,
             reset_local_sequence_number: false,
+            should_wrap_connection_id: false,
         }])
     }
 }

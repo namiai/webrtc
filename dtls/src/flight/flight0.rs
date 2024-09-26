@@ -50,6 +50,11 @@ impl Flight for Flight0 {
 
         state.handshake_recv_sequence = seq;
 
+        // Connection Identifiers must be negotiated afresh on session resumption.
+        // https://datatracker.ietf.org/doc/html/rfc9146#name-the-connection_id-extension
+        *state.local_connection_id.write().await = None;
+        *state.remote_connection_id.write().await = None;
+
         if let Some(message) = msgs.get(&HandshakeType::ClientHello) {
             // Validate type
             let client_hello = match message {
@@ -137,8 +142,20 @@ impl Flight for Flight0 {
                     Extension::ServerName(e) => {
                         state.server_name.clone_from(&e.server_name); // remote server name
                     }
+                    Extension::ConnectionId(cid) => {
+                        // Only set connection ID to be sent if server supports connection
+                        // IDs.
+                        if cfg.connection_id_generator.is_some() {
+                            *state.remote_connection_id.write().await = Some(cid.connection_id.clone());
+                        }
+                    }
                     _ => {}
                 }
+            }
+            // If the client doesn't support connection IDs, the server should not
+            // expect one to be sent.
+            if state.remote_connection_id.read().await.is_none() {
+                *state.local_connection_id.write().await = None;
             }
 
             if cfg.extended_master_secret == ExtendedMasterSecretType::Require

@@ -17,6 +17,7 @@ pub enum ContentType {
     Alert = 21,
     Handshake = 22,
     ApplicationData = 23,
+    ConnectionId = 25,
     #[default]
     Invalid,
 }
@@ -28,7 +29,21 @@ impl From<u8> for ContentType {
             21 => ContentType::Alert,
             22 => ContentType::Handshake,
             23 => ContentType::ApplicationData,
+            25 => ContentType::ConnectionId,
             _ => ContentType::Invalid,
+        }
+    }
+}
+
+impl Into<u8> for ContentType {
+    fn into(self) -> u8 {
+        match self {
+            ContentType::ChangeCipherSpec => 20,
+            ContentType::Alert => 21,
+            ContentType::Handshake => 22,
+            ContentType::ApplicationData => 23,
+            ContentType::ConnectionId => 25,
+            ContentType::Invalid => 0,
         }
     }
 }
