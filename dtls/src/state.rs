@@ -1,6 +1,6 @@
 use std::io::{BufWriter, Cursor};
 use std::marker::{Send, Sync};
-use std::sync::atomic::{Ordering, AtomicPtr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;

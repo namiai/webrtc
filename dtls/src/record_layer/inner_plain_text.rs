@@ -1,8 +1,8 @@
-use byteorder::{ReadBytesExt, WriteBytesExt};
+use byteorder::WriteBytesExt;
 
 use super::super::error::*;
 use crate::content::ContentType;
-use std::io::{Read, Write};
+use std::io::Write;
 
 pub(crate) struct InnerPlainText {
     pub(crate) content: Vec<u8>,
