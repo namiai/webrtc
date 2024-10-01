@@ -10,12 +10,19 @@ use tokio::sync::{mpsc, watch, Mutex};
 use super::*;
 use crate::error::Error;
 use crate::Buffer;
+use crate::sync::RwLock;
 
 const RECEIVE_MTU: usize = 8192;
 const DEFAULT_LISTEN_BACKLOG: usize = 128; // same as Linux default
 
 pub type AcceptFilterFn =
     Box<dyn (Fn(&[u8]) -> Pin<Box<dyn Future<Output = bool> + Send + 'static>>) + Send + Sync>;
+
+pub type ConnectionIdExtractorOutgoingMsgsFn =
+    fn(&[u8]) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'static>>;
+
+pub type ConnectionIdExtractorIncomingMsgsFn =
+    Box<dyn (Fn(&[u8]) -> Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'static>>) + Send + Sync>;
 
 type AcceptDoneCh = (mpsc::Receiver<Arc<UdpConn>>, watch::Receiver<()>);
 
@@ -30,7 +37,7 @@ struct ListenerImpl {
     accept_ch_tx: Arc<Mutex<Option<mpsc::Sender<Arc<UdpConn>>>>>,
     done_ch_tx: Arc<Mutex<Option<watch::Sender<()>>>>,
     ch_rx: Arc<Mutex<AcceptDoneCh>>,
-    conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
+    conns_map: Arc<RwLock<HashMap<String, Vec<Arc<UdpConn>>>>>,
 }
 
 #[async_trait]
@@ -42,7 +49,7 @@ impl Listener for ListenerImpl {
         tokio::select! {
             c = accept_ch_rx.recv() =>{
                 if let Some(c) = c{
-                    let raddr = c.raddr;
+                    let raddr = *c.raddr.read();
                     Ok((c, raddr))
                 }else{
                     Err(Error::ErrClosedListenerAcceptCh)
@@ -95,6 +102,20 @@ pub struct ListenConfig {
     /// as in the existing connection.
     /// It's done to satisfy the requirement rfc6347#section-4.2.8
     pub new_conn_filter: Option<AcceptFilterFn>,
+
+    // connection_id_extractor extracts connection IDs from outgoing ServerHello records
+    // and associates them with the associated connection.
+    // NOTE: a ServerHello should always be the first record in a datagram if
+    // multiple are present, so we avoid iterating through all packets if the first
+    // is not a ServerHello.
+    pub connection_id_extractor_outgoing_msg: Option<ConnectionIdExtractorOutgoingMsgsFn>,
+
+    // connection_id_router extracts connection IDs from incoming datagram payloads and
+    // uses them to route to the proper connection.
+    // NOTE: properly routing datagrams based on connection IDs requires using
+    // constant size connection IDs.
+    pub connection_id_extractor_incoming_msg: Option<ConnectionIdExtractorIncomingMsgsFn>
+
 }
 
 pub async fn listen<A: ToSocketAddrs>(laddr: A) -> Result<impl Listener> {
@@ -123,15 +144,17 @@ impl ListenConfig {
             accept_ch_tx: Arc::new(Mutex::new(Some(accept_ch_tx))),
             done_ch_tx: Arc::new(Mutex::new(Some(done_ch_tx))),
             ch_rx: Arc::new(Mutex::new((accept_ch_rx, done_ch_rx.clone()))),
-            conns: Arc::new(Mutex::new(HashMap::new())),
+            conns_map: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let pconn = Arc::clone(&l.pconn);
         let accepting = Arc::clone(&l.accepting);
         let accept_filter = self.accept_filter.take();
         let new_conn_filter = self.new_conn_filter.take();
+        let connection_id_extractor_incoming_msg = self.connection_id_extractor_incoming_msg.take();
+        let connection_id_extractor_outgoing_msg = self.connection_id_extractor_outgoing_msg.take();
         let accept_ch_tx = Arc::clone(&l.accept_ch_tx);
-        let conns = Arc::clone(&l.conns);
+        let conns_map = Arc::clone(&l.conns_map);
         tokio::spawn(async move {
             ListenConfig::read_loop(
                 done_ch_rx,
@@ -139,8 +162,10 @@ impl ListenConfig {
                 accepting,
                 accept_filter,
                 new_conn_filter,
+                connection_id_extractor_incoming_msg,
+                connection_id_extractor_outgoing_msg,
                 accept_ch_tx,
-                conns,
+                conns_map,
             )
             .await;
         });
@@ -158,12 +183,15 @@ impl ListenConfig {
         accepting: Arc<AtomicBool>,
         accept_filter: Option<AcceptFilterFn>,
         new_conn_filter: Option<AcceptFilterFn>,
+        connection_id_extractor_incoming_msg: Option<ConnectionIdExtractorIncomingMsgsFn>,
+        connection_id_extractor_outgoing_msg: Option<ConnectionIdExtractorOutgoingMsgsFn>,
         accept_ch_tx: Arc<Mutex<Option<mpsc::Sender<Arc<UdpConn>>>>>,
-        conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
+        conns_map: Arc<RwLock<HashMap<String, Vec<Arc<UdpConn>>>>>,
     ) {
         let mut buf = vec![0u8; RECEIVE_MTU];
 
         loop {
+            let connection_id_extractor_outgoing_msg = connection_id_extractor_outgoing_msg;
             tokio::select! {
                 _ = done_ch_rx.changed() => {
                     break;
@@ -176,8 +204,10 @@ impl ListenConfig {
                                 &accepting,
                                 &accept_filter,
                                 &new_conn_filter,
+                                &connection_id_extractor_incoming_msg,
+                                connection_id_extractor_outgoing_msg,
                                 &accept_ch_tx,
-                                &conns,
+                                &conns_map,
                                 raddr,
                                 &buf[..n],
                             )
@@ -206,14 +236,33 @@ impl ListenConfig {
         accepting: &Arc<AtomicBool>,
         accept_filter: &Option<AcceptFilterFn>,
         new_conn_filter: &Option<AcceptFilterFn>,
+        connection_id_extractor_incoming_msg: &Option<ConnectionIdExtractorIncomingMsgsFn>,
+        connection_id_extractor_outgoing_msg: Option<ConnectionIdExtractorOutgoingMsgsFn>,
         accept_ch_tx: &Arc<Mutex<Option<mpsc::Sender<Arc<UdpConn>>>>>,
-        conns: &Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
+        conns_map: &Arc<RwLock<HashMap<String, Vec<Arc<UdpConn>>>>>,
         raddr: SocketAddr,
         buf: &[u8],
     ) -> Result<Option<Arc<UdpConn>>> {
         {
-            let m = conns.lock().await;
+            if let Some(f) = connection_id_extractor_incoming_msg {
+                if let Some(connection_id) = f(buf).await {
+                    let m = conns_map.read();
+                    if let Some(conn) = m.get(connection_id_to_string(&connection_id).as_str()).and_then(|v| v.last()) {
+                        return Ok(Some(conn.clone()));
+                    }
+                }
+            }
+        }
+        {
+            let conn = {
+                let m = conns_map.read();
             if let Some(conn) = m.get(raddr.to_string().as_str()).and_then(|v| v.last()) {
+                conn.clone().into()
+            } else {
+                None
+            }
+            };
+            if let Some(conn) = conn {
                 if let Some(f) = new_conn_filter {
                     if !(f(buf).await) {
                         return Ok(Some(conn.clone()));
@@ -235,7 +284,13 @@ impl ListenConfig {
         }
 
         let session_id = SessionId(rand::random::<u64>().to_string());
-        let udp_conn = Arc::new(UdpConn::new(Arc::clone(pconn), Arc::clone(conns), raddr, session_id));
+        let udp_conn = Arc::new(UdpConn::new(
+            Arc::clone(pconn),
+            Arc::clone(conns_map),
+            raddr,
+            session_id,
+            connection_id_extractor_outgoing_msg,
+        ));
         {
             let accept_ch = accept_ch_tx.lock().await;
             if let Some(tx) = &*accept_ch {
@@ -248,7 +303,7 @@ impl ListenConfig {
         }
 
         {
-            let mut m = conns.lock().await;
+            let mut m = conns_map.write();
             let existing_value = m.entry(raddr.to_string()).or_insert_with(Vec::new);
             existing_value.push(Arc::clone(&udp_conn));
         }
@@ -260,24 +315,29 @@ impl ListenConfig {
 /// UdpConn augments a connection-oriented connection over a UdpSocket
 pub struct UdpConn {
     pconn: Arc<dyn Conn + Send + Sync>,
-    conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
-    raddr: SocketAddr,
+    conns_map: Arc<RwLock<HashMap<String, Vec<Arc<UdpConn>>>>>,
+    raddr: RwLock<SocketAddr>,
     buffer: Buffer,
     session_id: SessionId,
+    connection_id_extractor: Option<ConnectionIdExtractorOutgoingMsgsFn>,
+    connection_id: RwLock<Option<Vec<u8>>>
 }
 
 impl UdpConn {
     fn new(
         pconn: Arc<dyn Conn + Send + Sync>,
-        conns: Arc<Mutex<HashMap<String, Vec<Arc<UdpConn>>>>>,
+        conns_map: Arc<RwLock<HashMap<String, Vec<Arc<UdpConn>>>>>,
         raddr: SocketAddr,
         session_id: SessionId,
+        connection_id_extractor: Option<ConnectionIdExtractorOutgoingMsgsFn>,
     ) -> Self {
         UdpConn {
             pconn,
-            conns,
-            raddr,
+            conns_map,
+            raddr: RwLock::new(raddr),
             session_id,
+            connection_id_extractor,
+            connection_id: RwLock::new(None),
             buffer: Buffer::new(0, 0),
         }
     }
@@ -295,11 +355,21 @@ impl Conn for UdpConn {
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
         let n = self.buffer.read(buf, None).await?;
-        Ok((n, self.raddr))
+        Ok((n, *self.raddr.read()))
     }
 
     async fn send(&self, buf: &[u8]) -> Result<usize> {
-        self.pconn.send_to(buf, self.raddr).await
+        if let Some(f) = self.connection_id_extractor {
+            if let Some(cid) = f(buf).await {
+                self.update_connection_id(cid.clone());
+                let mut conns_map = self.conns_map.write();
+                if let Some(exisiting_value) = conns_map.remove(self.raddr.read().to_string().as_str()) {
+                    conns_map.insert(connection_id_to_string(&cid), exisiting_value.to_vec());
+                }
+            }
+        }
+        let raddr = *self.raddr.read();
+        self.pconn.send_to(buf, raddr).await
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> Result<usize> {
@@ -311,13 +381,24 @@ impl Conn for UdpConn {
     }
 
     fn remote_addr(&self) -> Option<SocketAddr> {
-        Some(self.raddr)
+        Some(*self.raddr.read())
     }
 
     async fn close(&self) -> Result<()> {
-        let mut conns = self.conns.lock().await;
-        if let Some(existing_value) = conns.get_mut(self.raddr.to_string().as_str()) {
+        let mut conns_map = self.conns_map.write();
+        if let Some(existing_value) = conns_map.get_mut(self.raddr.read().to_string().as_str()) {
             existing_value.retain(|c| c.session_id != self.session_id);
+            if existing_value.is_empty() {
+                conns_map.remove(self.raddr.read().to_string().as_str());
+            }
+        }
+        if let Some(connection_id) = self.connection_id.read().clone() {
+            if let Some(existing_value) = conns_map.get_mut(connection_id_to_string(&connection_id).as_str()) {
+                existing_value.retain(|c| c.session_id != self.session_id);
+                if existing_value.is_empty() {
+                    conns_map.remove(connection_id_to_string(&connection_id).as_str());
+                }
+            }
         }
         Ok(())
     }
@@ -325,4 +406,19 @@ impl Conn for UdpConn {
     fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
         self
     }
+    fn update_remote_addr(&self, raddr: SocketAddr) {
+        if *self.raddr.read() != raddr {
+            *self.raddr.write() = raddr;
+        }
+    }
+}
+
+impl UdpConn {
+    fn update_connection_id(&self, connection_id: Vec<u8>) {
+        *self.connection_id.write() = Some(connection_id);
+    }
+}
+
+fn connection_id_to_string(cid: &Vec<u8>) -> String {
+    format!("{:02x?}", cid)
 }

@@ -889,11 +889,11 @@ impl DTLSConn {
         local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>,
         remote_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
     ) -> Result<()> {
-        let n = next_conn.recv(buf).await?;
+        let (n, raddr) = next_conn.recv_from(buf).await?;
         let pkts = content_aware_unpack_datagram(&buf[..n], local_connection_id.read().await.as_ref().map_or(0, |l| l.len()))?;
         let mut has_handshake = false;
         for pkt in pkts {
-            let (hs, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, pkt, true, local_connection_id).await;
+            let (hs, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, pkt, true, local_connection_id, &next_conn, raddr).await;
             if let Some(alert) = alert {
                 let alert_err = ctx
                     .packet_tx
@@ -956,7 +956,16 @@ impl DTLSConn {
                                 //trace!("recv handle_queue: {} ", srv_cli_str(ctx.is_client));
 
                                 let pkts = ctx.encrypted_packets.drain(..).collect();
-                                DTLSConn::handle_queued_packets(ctx, local_epoch, handshake_completed_successfully, pkts, remote_connection_id, local_connection_id).await?;
+                                DTLSConn::handle_queued_packets(
+                                    ctx,
+                                    local_epoch,
+                                    handshake_completed_successfully,
+                                    pkts,
+                                    remote_connection_id,
+                                    local_connection_id,
+                                    next_conn,
+                                    raddr
+                                ).await?;
 
                                 drop(done);
                             }
@@ -975,10 +984,12 @@ impl DTLSConn {
         handshake_completed_successfully: &Arc<AtomicBool>,
         pkts: Vec<Vec<u8>>,
         remote_connection_id: &Arc<RwLock<Option<Vec<u8>>>>,
-        local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
+        local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>,
+        next_conn: &Arc<dyn util::Conn + Send + Sync>,
+        remote_addr: SocketAddr,
     ) -> Result<()> {
         for p in pkts {
-            let (_, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, p, false, local_connection_id).await; // don't re-enqueue
+            let (_, alert, mut err) = DTLSConn::handle_incoming_packet(ctx, p, false, local_connection_id, next_conn, remote_addr).await; // don't re-enqueue
             if let Some(alert) = alert {
                 let alert_err = ctx
                     .packet_tx
@@ -1024,7 +1035,9 @@ impl DTLSConn {
         ctx: &mut ConnReaderContext,
         mut pkt: Vec<u8>,
         enqueue: bool,
-        local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>
+        local_connection_id: &Arc<RwLock<Option<Vec<u8>>>>,
+        conn: &Arc<dyn util::Conn + Send + Sync>,
+        remote_addr: SocketAddr
     ) -> (bool, Option<Alert>, Option<Error>) {
         let mut reader = BufReader::new(pkt.as_slice());
         let mut h = RecordLayerHeader::new();
@@ -1342,9 +1355,9 @@ impl DTLSConn {
         // Any valid connection ID record is a candidate for updating the remote
         // address if it is the latest record received.
         // https://datatracker.ietf.org/doc/html/rfc9146#peer-address-update
-        // if original_cid && is_latest_seq_num {
-
-        // }
+        if original_cid && is_latest_seq_num {
+            conn.update_remote_addr(remote_addr)
+        }
         (false, None, None)
     }
 
