@@ -359,6 +359,9 @@ impl Conn for UdpConn {
     }
 
     async fn send(&self, buf: &[u8]) -> Result<usize> {
+        // TODO: connection id concept is related to DTLS only,
+        // it should not live in the util module and should not be related to the generic
+        // UDP listener
         if let Some(f) = self.connection_id_extractor {
             if let Some(cid) = f(buf).await {
                 self.update_connection_id(cid.clone());
