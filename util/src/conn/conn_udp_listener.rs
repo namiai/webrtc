@@ -357,6 +357,10 @@ impl Conn for UdpConn {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        // read and discard the remote address
+        let mut raddr_buf = vec![0u8;64];
+        let _ = self.buffer.read(&mut raddr_buf, None).await?;
+
         Ok(self.buffer.read(buf, None).await?)
     }
 
