@@ -2,6 +2,7 @@ use core::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 
 use portable_atomic::AtomicBool;
 use tokio::net::UdpSocket;
@@ -218,6 +219,12 @@ impl ListenConfig {
                             };
 
                             if let Some(conn) = udp_conn {
+                                // for the cases when this listener is used for the DTLS transport
+                                // we need to keep the raddr that was used to send the packet
+                                // in the case when we use connection IDs to route the packets
+                                let raddr = raddr.to_owned();
+                                let raddr_serialized = raddr.to_string();
+                                let _ = conn.buffer.write(raddr_serialized.as_bytes()).await;
                                 let _ = conn.buffer.write(&buf[..n]).await;
                             }
                         }
@@ -354,8 +361,16 @@ impl Conn for UdpConn {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+        // each record in buffer now consists of 2 records:
+        // 1. remote address
+        // 2. payload
+        // Read them seaparately
+        let mut raddr_buf = vec![0u8;64];
+        let bytes_read = self.buffer.read(&mut raddr_buf, None).await?;
+        let raddr_s = unsafe { std::str::from_utf8_unchecked(&raddr_buf[..bytes_read]) };
+        let raddr:SocketAddr = raddr_s.parse().expect("Cannot parse socket address");
         let n = self.buffer.read(buf, None).await?;
-        Ok((n, *self.raddr.read()))
+        Ok((n, raddr))
     }
 
     async fn send(&self, buf: &[u8]) -> Result<usize> {
